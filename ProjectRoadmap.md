@@ -31,7 +31,7 @@ Estimated total time: **4–6 weeks** building part-time (~2hrs/day).
 - Set up a Python virtual environment:
   ```bash
   python -m venv venv
-  source venv/bin/activate  # Windows: venv\Scripts\activate
+  Windows: venv\Scripts\activate # Mac/Linux: source venv/bin/activate 
   ```
 - Install initial dependencies:
   ```bash
