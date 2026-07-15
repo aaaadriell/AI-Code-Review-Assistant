@@ -109,13 +109,7 @@ in one terminal and `python test_trigger.py` in another — this exercises the e
 pipeline end-to-end (diff fetch, Claude call, structured output, comment posted to the
 real PR) with zero tunneling.
 
-*Optional — if you want to see the real GitHub Action fire:* your computer can't run
-ngrok's Docker image without virtualization support, but plain ngrok doesn't need
-Docker at all — install the standalone binary from ngrok.com/download (or
-`choco install ngrok`) and run `ngrok http 8000` as usual. Cloudflare Tunnel
-(`cloudflared`) is a Docker-free alternative too. Either way, this is optional for
-Phase 1-4 — in Phase 5 you'll deploy to Railway and get a permanent public URL, which
-is the more natural place to verify the real GitHub Actions → service hop.
+Later in Phase 5 you'll deploy to Railway and get a permanent public URL to replace this.
 
 **1.3 — Write the GitHub Actions workflow**
 
@@ -143,7 +137,7 @@ jobs:
             }'
 ```
 
-Add `REVIEW_SERVICE_URL` as a secret in your sandbox repo (Settings → Secrets → Actions).
+Add `REVIEW_SERVICE_URL` as a secret in your sandbox repo (Settings → Secrets → Actions). (Not now though)
 
 **1.4 — Fetch the diff in the Review Service**
 
@@ -170,18 +164,17 @@ import anthropic
 def review_diff(diff: str) -> str:
     client = anthropic.Anthropic()
     message = client.messages.create(
-        model="claude-opus-4-8",
+        model="claude--4-8",
         max_tokens=2048,
         messages=[
             {
                 "role": "user",
                 "content": f"""You are a senior software engineer reviewing a pull request.
-Review the following diff and identify bugs, security issues, and style problems.
+                            Review the following diff and identify bugs, security issues, and style problems.
+                DIFF:
+                {diff}
 
-DIFF:
-{diff}
-
-Provide your feedback as a list of issues."""
+                Provide your feedback as a list of issues."""
             }
         ]
     )
@@ -202,8 +195,7 @@ def post_pr_comment(repo_name: str, pr_number: int, body: str):
 
 Open a PR in your sandbox repo with an intentional bug (e.g. a SQL string concatenation).
 Run `test_trigger.py` with that PR's number/SHAs, and watch your service receive the
-request, Claude respond, and a comment appear on the PR. If you set up ngrok/cloudflared
-in 1.2, you can instead just push a commit and watch the real Action fire end-to-end.
+request, Claude respond, and a comment appear on the PR. The entire pipeline works end-to-end.
 
 **✅ Phase 1 checkpoint: A comment appears on your PR. Content doesn't matter yet — the pipe works.**
 
