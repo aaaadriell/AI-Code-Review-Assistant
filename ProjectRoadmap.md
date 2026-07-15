@@ -83,16 +83,39 @@ Run it locally:
 uvicorn main:app --reload
 ```
 
-**1.2 — Expose your local service to GitHub**
+**1.2 — Trigger the service locally (no tunnel needed)**
 
-GitHub Actions needs to call your service. During development, use **ngrok** to tunnel:
-```bash
-# Install ngrok, then:
-ngrok http 8000
-# Copy the https URL e.g. https://abc123.ngrok.io
+You don't need your service to be reachable from the internet to build and test
+most of the pipeline — only the real GitHub Actions → your machine hop needs that.
+Everything downstream (fetch diff, call Claude, post PR comment) just needs your
+machine to reach GitHub's API, which it already can.
+
+Write a small local script, `test_trigger.py`, that POSTs the same JSON payload
+the GitHub Action would send, straight to your local service:
+
+```python
+import requests
+
+requests.post("http://localhost:8000/review", json={
+    "repo": "your-username/ai-review-sandbox",
+    "pr_number": 1,
+    "base_sha": "...",
+    "head_sha": "..."
+})
 ```
 
-Later in Phase 5 you'll replace this with a real deployment URL.
+Fill in real values from an open PR in your sandbox repo. Run `uvicorn main:app --reload`
+in one terminal and `python test_trigger.py` in another — this exercises the entire
+pipeline end-to-end (diff fetch, Claude call, structured output, comment posted to the
+real PR) with zero tunneling.
+
+*Optional — if you want to see the real GitHub Action fire:* your computer can't run
+ngrok's Docker image without virtualization support, but plain ngrok doesn't need
+Docker at all — install the standalone binary from ngrok.com/download (or
+`choco install ngrok`) and run `ngrok http 8000` as usual. Cloudflare Tunnel
+(`cloudflared`) is a Docker-free alternative too. Either way, this is optional for
+Phase 1-4 — in Phase 5 you'll deploy to Railway and get a permanent public URL, which
+is the more natural place to verify the real GitHub Actions → service hop.
 
 **1.3 — Write the GitHub Actions workflow**
 
@@ -178,7 +201,9 @@ def post_pr_comment(repo_name: str, pr_number: int, body: str):
 **1.7 — Wire it all together and test**
 
 Open a PR in your sandbox repo with an intentional bug (e.g. a SQL string concatenation).
-Watch the Action fire, your service receive the request, Claude respond, and a comment appear on the PR.
+Run `test_trigger.py` with that PR's number/SHAs, and watch your service receive the
+request, Claude respond, and a comment appear on the PR. If you set up ngrok/cloudflared
+in 1.2, you can instead just push a commit and watch the real Action fire end-to-end.
 
 **✅ Phase 1 checkpoint: A comment appears on your PR. Content doesn't matter yet — the pipe works.**
 
