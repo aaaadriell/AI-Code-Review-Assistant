@@ -1,0 +1,16 @@
+name: Re-index Codebase
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  reindex:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-index codebase
+        run: |
+          curl -X POST ${{ secrets.REVIEW_SERVICE_URL }}/reindex \
+            -H "Content-Type: application/json" \
+            -d "{\"repo\": \"${{ github.repository }}\"}"

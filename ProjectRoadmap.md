@@ -15,6 +15,26 @@ Estimated total time: **4–6 weeks** building part-time (~2hrs/day).
 
 ---
 
+## Key Packages & Why We Use Them
+
+**FastAPI** — Web framework for your review service. Lightweight, modern, and perfect for building the HTTP endpoint that GitHub Actions will call.
+
+**PyGithub** — Python library for GitHub API. Handles fetching PRs, diffs, and posting comments without dealing with raw HTTP requests.
+
+**anthropic** — Official Anthropic SDK. Calls Claude for code review analysis and retrieval query generation.
+
+**pydantic** — Schema validation for structured output. Ensures Claude's JSON responses match your expected format, catching errors early.
+
+**llama-index** — Orchestration framework for RAG (Retrieval-Augmented Generation). Handles loading documents, managing embeddings, and querying vector stores without reinventing the wheel.
+
+**chromadb** — Vector database for storing code embeddings locally. Persists to disk so your index survives restarts, and enables semantic search over your codebase.
+
+**tree-sitter** + **tree-sitter-python** — AST parser for Python code. Critical for smart chunking: splits code by functions/classes (semantic units) instead of character count, so retrieval returns whole functions instead of fragments.
+
+**sentence-transformers** (via llama-index) — Generates embeddings (vector representations) of code for semantic search. HuggingFace's `BAAI/bge-small-en-v1.5` is small, fast, and open-source.
+
+---
+
 ## Phase 0 — Environment Setup
 **Goal: Everything installed, credentials working, test repo ready.**
 **Estimated time: 1–2 days**
@@ -164,7 +184,7 @@ import anthropic
 def review_diff(diff: str) -> str:
     client = anthropic.Anthropic()
     message = client.messages.create(
-        model="claude--4-8",
+        model="claude-opus-4-8",
         max_tokens=2048,
         messages=[
             {
@@ -348,17 +368,18 @@ Add code to your sandbox repo that violates specific RULES.md rules. Verify that
 **3.1 — Install RAG dependencies**
 
 ```bash
-pip install llama-index chromadb tree-sitter tree-sitter-python
+pip install llama-index chromadb tree-sitter tree-sitter-python llama-index-vector-stores-chroma llama-index-embeddings-huggingface
 ```
 
 **3.2 — Clone and index the target repo**
 
-Create `indexer.py`:
+Create `indexer.py`. Uses HuggingFace embeddings (free, no API key needed):
 
 ```python
 from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.core import StorageContext
+from llama_index.legacy.embeddings.huggingface import HuggingFaceEmbedding
 import chromadb
 
 def build_index(repo_path: str):
@@ -369,6 +390,9 @@ def build_index(repo_path: str):
         recursive=True
     ).load_data()
 
+    # Use HuggingFace embeddings (free, no API key required)
+    embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
+
     # Set up ChromaDB
     chroma_client = chromadb.PersistentClient(path="./chroma_db")
     chroma_collection = chroma_client.get_or_create_collection("codebase")
@@ -378,30 +402,39 @@ def build_index(repo_path: str):
     # Build and persist the index
     index = VectorStoreIndex.from_documents(
         documents,
-        storage_context=storage_context
+        storage_context=storage_context,
+        embed_model=embed_model
     )
     print(f"Indexed {len(documents)} files.")
     return index
 ```
 
-Run this once to build the index from your sandbox repo.
+Run this once to build the index from your sandbox repo. HuggingFace embeddings are open-source and free — no additional API keys needed.
 
 **3.3 — Use Tree-sitter for smarter chunking (important)**
 
 By default, LlamaIndex chunks by character count, which splits functions mid-way.
 Tree-sitter chunks by AST — whole functions and classes only. This makes retrieval
-far more useful.
+far more useful. Add this to your `build_index()` function in `indexer.py`:
 
 ```python
 from llama_index.core.node_parser import CodeSplitter
 
+# Inside build_index(), after loading documents:
 splitter = CodeSplitter(
     language="python",
     chunk_lines=40,
     chunk_lines_overlap=5,
     max_chars=1500,
 )
-# Pass this to VectorStoreIndex.from_documents() as transformations=[splitter]
+
+# Pass to VectorStoreIndex.from_documents() as:
+index = VectorStoreIndex.from_documents(
+    documents,
+    storage_context=storage_context,
+    embed_model=embed_model,
+    transformations=[splitter]
+)
 ```
 
 **3.4 — Build the retrieval function**
@@ -434,7 +467,7 @@ You need a good query to find relevant files. Ask Claude to generate one:
 def generate_retrieval_query(diff: str) -> str:
     client = anthropic.Anthropic()
     message = client.messages.create(
-        model="claude-haiku-4-5-20251001",  # Use Haiku here — cheap, fast
+        model="claude-haiku-4-5-20251001",
         max_tokens=200,
         messages=[{
             "role": "user",
@@ -453,17 +486,26 @@ Query:"""
 
 **3.6 — Wire RAG context into the review prompt**
 
-Update your main review function:
+Update your main review function in `main.py`:
 
 ```python
+import json
+from models import ReviewResult
+
 def review_diff(diff: str, rules: str) -> ReviewResult:
+    client = anthropic.Anthropic()
+
     # Step 1: generate retrieval query
     query = generate_retrieval_query(diff)
+    print(f"Generated retrieval query: {query}")
 
     # Step 2: retrieve relevant context
     context = retrieve_context(query, top_k=5)
+    print(f"Retrieved context: {len(context)} chars")
 
     # Step 3: call Claude with diff + context + rules
+    schema = ReviewResult.model_json_schema()
+
     message = client.messages.create(
         model="claude-opus-4-8",
         max_tokens=4096,
@@ -480,24 +522,54 @@ RELATED CODEBASE CONTEXT (files that may be affected by this change):
 DIFF TO REVIEW:
 {diff}
 
-Return ONLY a JSON object matching the ReviewResult schema."""
+Return ONLY a JSON object matching this schema. No prose outside the JSON.
+Schema: {json.dumps(schema)}"""
         }]
     )
-    ...
+
+    raw = message.content[0].text
+    return ReviewResult.model_validate_json(raw)
 ```
 
 **3.7 — Handle index freshness**
 
-The index needs to stay current with the repo. Add a GitHub Action step that
-re-indexes on push to main:
+The index needs to stay current with the repo. Create `.github/workflows/re-index_codebase.yml`
+in your **reviewer repo** to re-index whenever the sandbox repo changes:
 
 ```yaml
-- name: Re-index codebase
-  run: curl -X POST ${{ secrets.REVIEW_SERVICE_URL }}/reindex \
-    -d '{"repo": "${{ github.repository }}"}'
+name: Re-index Codebase
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  reindex:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-index codebase
+        run: |
+          curl -X POST ${{ secrets.REVIEW_SERVICE_URL }}/reindex \
+            -H "Content-Type: application/json" \
+            -d "{\"repo\": \"${{ github.repository }}\"}"
 ```
 
-Add a `/reindex` endpoint to your FastAPI service that re-runs `build_index()`.
+Also add a `/reindex` endpoint to your FastAPI service in `main.py`:
+
+```python
+@app.post("/reindex")
+async def reindex(request: Request):
+    from indexer import build_index
+    payload = await request.json()
+    
+    try:
+        print(f"Re-indexing codebase...")
+        build_index("path-to-your-sandbox-repo")
+        return {"status": "success"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+```
 
 **✅ Phase 3 checkpoint: LLM comments reference code outside the diff (e.g. "this change will break the caller in `services/auth.py` line 88").**
 
@@ -580,7 +652,6 @@ Railway is the easiest option:
 - Railway auto-deploys on push — you get a live HTTPS URL
 
 Update `REVIEW_SERVICE_URL` in your sandbox repo secrets to the Railway URL.
-Remove ngrok.
 
 **5.2 — Handle ChromaDB in production**
 
@@ -618,6 +689,16 @@ Cover the RAG over codebase decision and what surprised you. This gets you inbou
 interest without applying cold.
 
 **✅ Phase 5 checkpoint: Live URL in README, demo video recorded, LinkedIn post published.**
+
+---
+
+## What Makes This Portfolio-Grade
+
+- **RAG over a codebase** (not just documents) — shows you understand retrieval beyond the tutorial use case
+- **Structured LLM output with schema enforcement** — shows production thinking
+- **Observability from day one** — most candidates skip this entirely
+- **RULES.md as a configuration layer** — shows you thought about the real user (the senior engineer), not just the demo
+- **Honest scope** — you can articulate clearly what it does and doesn't do, and why
 
 ---
 
