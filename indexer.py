@@ -12,7 +12,7 @@ def build_index(repo_path: str):
         repo_path,
         required_exts=[".py"],
         recursive=True,
-        exclude=["venv", ".venv", "__pycache__", ".git", "node_modules", ".pytest_cache"]
+        exclude=["venv", ".venv", "__pycache__", ".git", "node_modules", ".pytest_cache", "package.json", "package-lock.json", "yarn.lock", "poetry.lock", "Pipfile", "Pipfile.lock", ".env"]
     ).load_data()
 
     # Use HuggingFace embeddings (free, no API key needed)
