@@ -2,7 +2,7 @@ import requests
 
 requests.post("http://localhost:8000/review", json={
     "repo": "aaaadriell/AI-Code-Review-Sandbox",
-    "pr_number": 2,
-    "base_sha": "98551ec1400f3bfe7898e4cdf590862c52040301",
-    "head_sha": "9b357ed86bde209e3319428b8d272b550465c6f1"
+    "pr_number": 6,
+    "base_sha": "67c5a9f453e7d56647283673b49a86843e71f211",
+    "head_sha": "61fe874eff3ddd9c9b2ac782551d9d198abcf9da"
 })

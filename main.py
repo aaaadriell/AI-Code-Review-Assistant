@@ -94,17 +94,20 @@ def get_rules(repo_name: str) -> str:
 async def review(request: Request):
     payload = await request.json()
     print(f"1. Received payload: {payload}")
-    
+
     try:
         diff = get_pr_diff(payload["repo"], payload["pr_number"])
         print(f"2. Got diff: {len(diff)} chars")
-        
-        feedback = review_diff(diff)
-        print(f"3. Got feedback: {feedback}")
-        
+
+        rules = get_rules(payload["repo"])
+        print(f"3. Got rules: {len(rules)} chars")
+
+        feedback = review_diff(diff, rules)
+        print(f"4. Got feedback: {feedback}")
+
         post_review_comments(payload["repo"], payload["pr_number"], feedback, payload["head_sha"])
-        print("4. Posted comment successfully")
-        
+        print("5. Posted comment successfully")
+
         return {"status": "success"}
     except Exception as e:
         print(f"ERROR: {e}")
