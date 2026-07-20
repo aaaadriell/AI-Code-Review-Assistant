@@ -213,6 +213,7 @@ async def feedback(request: Request):
     payload = await request.json()
     pr_number = payload.get("pr_number")
     trace_id = payload.get("comment_id")  # This is the trace ID from Langfuse
+    observation_id = payload.get("observation_id")  # Optional, if you want to attach to a specific observation
     helpful = payload.get("helpful")  # True or False
 
     try:
@@ -235,7 +236,9 @@ async def feedback(request: Request):
             "name": "helpful",
             "value": 1 if helpful else 0,
             "dataType": "BOOLEAN",
-            "comment": payload.get("comment", "")
+            "comment": payload.get("comment", ""),
+            # observationId is optional - Langfuse will attach to the trace root if not provided
+            "observationId": observation_id
         }
 
         response = requests.post(

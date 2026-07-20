@@ -33,6 +33,8 @@ Estimated total time: **4–6 weeks** building part-time (~2hrs/day).
 
 **sentence-transformers** (via llama-index) — Generates embeddings (vector representations) of code for semantic search. HuggingFace's `BAAI/bge-small-en-v1.5` is small, fast, and open-source.
 
+**langfuse** — Production observability for LLM applications. Automatically tracks every LLM call (via `@observe()` decorator) to capture latency, token cost, and errors. Provides a dashboard to monitor review quality, costs, and user feedback scores. Essential for understanding real-world performance and ROI of your AI service.
+
 ---
 
 ## Phase 0 — Environment Setup
@@ -617,23 +619,89 @@ Build a simple cost dashboard query: average cost per PR, total monthly cost.
 
 **4.4 — Add a feedback endpoint**
 
-When an engineer marks a comment as unhelpful, log it:
+Add a `/feedback` endpoint that submits scores to Langfuse via REST API:
 
 ```python
 @app.post("/feedback")
-async def feedback(pr_number: int, comment_id: str, helpful: bool):
-    langfuse.score(
-        trace_id=comment_id,
-        name="helpful",
-        value=1 if helpful else 0
+async def feedback(request: Request):
+    payload = await request.json()
+    trace_id = payload.get("comment_id")  # Trace ID from Langfuse
+    observation_id = payload.get("observation_id")  # Optional: observation ID within the trace
+    helpful = payload.get("helpful")  # True or False
+
+    # Call Langfuse REST API
+    score_payload = {
+        "traceId": trace_id,
+        "observationId": observation_id,  # Include to attach to specific observation
+        "name": "helpful",
+        "value": 1 if helpful else 0,
+        "dataType": "BOOLEAN",
+        "comment": payload.get("comment", "")
+    }
+    
+    response = requests.post(
+        f"{os.getenv('LANGFUSE_BASE_URL')}/api/public/scores",
+        json=score_payload,
+        auth=HTTPBasicAuth(os.getenv("LANGFUSE_PUBLIC_KEY"), os.getenv("LANGFUSE_SECRET_KEY"))
     )
-    return {"status": "logged"}
+    return {"status": "success" if response.status_code in [200, 201] else "error"}
 ```
 
-You can trigger this via a slash command in the PR comment (e.g. `/not-helpful`) using
-a GitHub Actions workflow that listens for issue_comment events.
+**To test the feedback endpoint:**
+
+1. Get a trace ID and observation ID from Langfuse dashboard
+2. Call `/feedback`:
+   ```bash
+   curl -X POST http://localhost:8000/feedback \
+     -H "Content-Type: application/json" \
+     -d '{
+       "pr_number": 6,
+       "comment_id": "[trace-id-from-langfuse]",
+       "observation_id": "[observation-id-from-langfuse]",
+       "helpful": true,
+       "comment": "Great catch!"
+     }'
+   ```
+3. Check Langfuse dashboard → click into the trace → Scores tab → you should see the score
 
 **✅ Phase 4 checkpoint: Langfuse dashboard shows latency, cost, and feedback scores per PR.**
+
+---
+
+## Testing All Endpoints
+
+**Start the server:**
+```bash
+uvicorn main:app --reload
+```
+
+**Test /review endpoint** (triggers a code review):
+```bash
+python test_trigger.py
+```
+This will review all open PRs in your sandbox repo and post comments.
+
+**Test /feedback endpoint** (submit feedback on a review):
+```bash
+curl -X POST http://localhost:8000/feedback \
+  -H "Content-Type: application/json" \
+  -d '{
+    "pr_number": 6,
+    "comment_id": "[get-from-langfuse-traces]",
+    "observation_id": "[get-from-langfuse-traces]",
+    "helpful": true,
+    "comment": "Good review!"
+  }'
+```
+
+**Test /reindex endpoint** (rebuild the codebase index):
+```bash
+curl -X POST http://localhost:8000/reindex \
+  -H "Content-Type: application/json" \
+  -d '{"repo": "aaaadriell/AI-Code-Review-Sandbox"}'
+```
+
+---
 
 ---
 
