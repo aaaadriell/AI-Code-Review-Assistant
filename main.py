@@ -1,24 +1,42 @@
 import json
-from unittest import result
 from fastapi import FastAPI, Request
 import os
 from dotenv import load_dotenv
 from github import Github, Auth
 import anthropic
 import chromadb
+import requests
+from requests.auth import HTTPBasicAuth
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.core import StorageContext, VectorStoreIndex
 
 from models import ReviewResult
 
+from langfuse import Langfuse, observe
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+
 load_dotenv()
 
 app = FastAPI()
 
+langfuse = Langfuse()
+
+# Initialize clients once at module level (reuse across requests)
+github_client = Github(auth=Auth.Token(os.getenv("GITHUB_TOKEN")))
+anthropic_client = anthropic.Anthropic()
+
+# Initialize embedding model (same as indexer.py)
+embed_model = HuggingFaceEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+# Initialize ChromaDB once (reuse across requests)
+chroma_client = chromadb.PersistentClient(path="./chroma_db")
+chroma_collection = chroma_client.get_or_create_collection("codebase")
+vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+storage_context = StorageContext.from_defaults(vector_store=vector_store)
+
 
 def get_pr_diff(repo_name: str, pr_number: int) -> str:
-    g = Github(os.getenv("GITHUB_TOKEN"))
-    repo = g.get_repo(repo_name)
+    repo = github_client.get_repo(repo_name)
     pr = repo.get_pull(pr_number)
 
     diff_text = ""
@@ -27,22 +45,12 @@ def get_pr_diff(repo_name: str, pr_number: int) -> str:
         diff_text += file.patch or "(binary file, skipped)"
     return diff_text
 
-
-def review_diff(diff: str, rules: str) -> ReviewResult:
-    client = anthropic.Anthropic()
-
-    # Step 1: generate retrieval query
-    query = generate_retrieval_query(diff)
-    print(f"Generated retrieval query: {query}")
-
-    # Step 2: retrieve relevant context
-    context = retrieve_context(query, top_k=5)
-    print(f"Retrieved context: {len(context)} chars")
-
-    # Step 3: call Claude with diff + context + rules
+@observe()
+def review_diff(diff: str, rules: str, context: str) -> ReviewResult:
+    # Call Claude with diff + context + rules (no need to regenerate query/context)
     schema = ReviewResult.model_json_schema()
 
-    message = client.messages.create(
+    message = anthropic_client.messages.create(
         model="claude-opus-4-8",
         max_tokens=4096,
         messages=[
@@ -70,8 +78,7 @@ def review_diff(diff: str, rules: str) -> ReviewResult:
 
 
 def post_review_comments(repo_name: str, pr_number: int, result: ReviewResult, head_sha: str):
-    g = Github(os.getenv("GITHUB_TOKEN"))
-    repo = g.get_repo(repo_name)
+    repo = github_client.get_repo(repo_name)
     pr = repo.get_pull(pr_number)
 
     # Post line-level comments
@@ -100,8 +107,7 @@ def post_review_comments(repo_name: str, pr_number: int, result: ReviewResult, h
 
 
 def get_rules(repo_name: str) -> str:
-    g = Github(os.getenv("GITHUB_TOKEN"))
-    repo = g.get_repo(repo_name)
+    repo = github_client.get_repo(repo_name)
     try:
         content = repo.get_contents("RULES.md")
         return content.decoded_content.decode("utf-8")
@@ -110,13 +116,8 @@ def get_rules(repo_name: str) -> str:
 
 
 def retrieve_context(query: str, top_k: int = 5) -> str:
-    chroma_client = chromadb.PersistentClient(path="./chroma_db")
-    chroma_collection = chroma_client.get_or_create_collection("codebase")
-    vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
-    storage_context = StorageContext.from_defaults(vector_store=vector_store)
-
     index = VectorStoreIndex.from_vector_store(
-        vector_store, storage_context=storage_context
+        vector_store, storage_context=storage_context, embed_model=embed_model
     )
     retriever = index.as_retriever(similarity_top_k=top_k)
     nodes = retriever.retrieve(query)
@@ -129,8 +130,7 @@ def retrieve_context(query: str, top_k: int = 5) -> str:
 
 
 def generate_retrieval_query(diff: str) -> str:
-    client = anthropic.Anthropic()
-    message = client.messages.create(
+    message = anthropic_client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=200,
         messages=[{
@@ -170,9 +170,13 @@ async def review(request: Request):
         print(f"6. Got feedback: {feedback}")
 
         post_review_comments(payload["repo"], payload["pr_number"], feedback, payload["head_sha"])
-        print("5. Posted comment successfully")
+        print("7. Posted comment successfully")
 
-        return {"status": "success"}
+        return {
+            "status": "success",
+            "pr_number": payload["pr_number"],
+            "message": "Check Langfuse dashboard for trace ID to use with /feedback endpoint"
+        }
     
     except Exception as e:
         print(f"ERROR: {e}")
@@ -185,19 +189,71 @@ async def reindex(request: Request):
     """Re-index the codebase when it changes."""
     payload = await request.json()
     repo_name = payload.get("repo")
-    
+
     try:
         print(f"Starting re-index for {repo_name}...")
         # Import your build_index function from indexer
         from indexer import build_index
-        
+
         # For now, re-index your sandbox repo
         build_index("path-to-your-sandbox-repo")
-        
+
         print("Re-index completed successfully")
         return {"status": "success", "message": "Index rebuilt"}
     except Exception as e:
         print(f"Re-index error: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/feedback")
+async def feedback(request: Request):
+    """Log feedback on AI review comments (helpful or not helpful)."""
+    payload = await request.json()
+    pr_number = payload.get("pr_number")
+    trace_id = payload.get("comment_id")  # This is the trace ID from Langfuse
+    helpful = payload.get("helpful")  # True or False
+
+    try:
+        print(f"Feedback endpoint called - PR: {pr_number}, Trace ID: {trace_id}, Helpful: {helpful}")
+
+        # Get Langfuse API credentials and base URL
+        public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
+        secret_key = os.getenv("LANGFUSE_SECRET_KEY")
+        base_url = os.getenv("LANGFUSE_BASE_URL", "https://cloud.langfuse.com")
+
+        if not public_key or not secret_key:
+            print("  Langfuse credentials not configured, skipping score")
+            return {"status": "success", "message": "Feedback recorded (Langfuse not configured)"}
+
+        # Call Langfuse REST API to submit score
+        langfuse_url = f"{base_url}/api/public/scores"
+
+        score_payload = {
+            "traceId": trace_id,
+            "name": "helpful",
+            "value": 1 if helpful else 0,
+            "dataType": "BOOLEAN",
+            "comment": payload.get("comment", "")
+        }
+
+        response = requests.post(
+            langfuse_url,
+            json=score_payload,
+            auth=HTTPBasicAuth(public_key, secret_key),
+            headers={"Content-Type": "application/json"}
+        )
+
+        if response.status_code in [200, 201]:
+            print(f"  Score submitted to Langfuse successfully: {response.json()}")
+        else:
+            print(f"  Langfuse API error: {response.status_code} - {response.text}")
+
+        print(f"Feedback logged for PR #{pr_number}: helpful={helpful}")
+        return {"status": "success", "message": "Feedback recorded"}
+    except Exception as e:
+        print(f"Feedback error: {e}")
         import traceback
         traceback.print_exc()
         return {"status": "error", "message": str(e)}
