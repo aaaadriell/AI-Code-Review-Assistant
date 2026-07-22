@@ -250,7 +250,7 @@ async def reindex(request: Request):
         from indexer import build_index
 
         # For now, re-index your sandbox repo
-        build_index("path-to-your-sandbox-repo")
+        build_index("C:\\Users\\adrie\\Documents\\AI-Code-Review-Sandbox")
 
         print("Re-index completed successfully")
         return {"status": "success", "message": "Index rebuilt"}
