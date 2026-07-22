@@ -68,6 +68,8 @@ def review_diff(diff: str, rules: str, context: str) -> ReviewResult:
                 {diff}
 
                 Return ONLY a JSON object matching this schema. No prose outside the JSON.
+                Every field in the schema is required for every comment object, including
+                "confidence" - never omit it.
                 Schema: {json.dumps(schema)}"""
             }
         ]
@@ -77,13 +79,61 @@ def review_diff(diff: str, rules: str, context: str) -> ReviewResult:
     return ReviewResult.model_validate_json(raw)
 
 
+def _valid_diff_lines(patch: str) -> set[int]:
+    """Return the set of new-file line numbers actually visible in a diff hunk.
+    GitHub only allows PR review comments on lines shown in the diff context,
+    not just any line that exists in the file."""
+    if not patch:
+        return set()
+
+    valid_lines = set()
+    current_line = None
+    for line in patch.splitlines():
+        if line.startswith("@@"):
+            # e.g. "@@ -10,7 +12,8 @@" -> new file starts at line 12
+            try:
+                plus_part = line.split("+")[1].split(" ")[0]
+                current_line = int(plus_part.split(",")[0])
+            except (IndexError, ValueError):
+                current_line = None
+            continue
+        if current_line is None:
+            continue
+        if line.startswith("\\"):
+            pass  # "\ No newline at end of file" marker - not a real line
+        elif line.startswith("+"):
+            valid_lines.add(current_line)
+            current_line += 1
+        elif line.startswith("-"):
+            pass  # removed lines don't exist in the new file
+        else:
+            valid_lines.add(current_line)  # context line
+            current_line += 1
+    return valid_lines
+
+
 def post_review_comments(repo_name: str, pr_number: int, result: ReviewResult, head_sha: str):
     repo = github_client.get_repo(repo_name)
     pr = repo.get_pull(pr_number)
 
-    # Post line-level comments
+    # Build a map of filename -> valid commentable line numbers from the real diff
+    valid_lines_by_file = {
+        file.filename: _valid_diff_lines(file.patch)
+        for file in pr.get_files()
+    }
+
+    # Post line-level comments (only where the line actually appears in the diff)
     comments = []
+    skipped = []
     for c in result.comments:
+        valid_lines = valid_lines_by_file.get(c.file)
+        if valid_lines is None:
+            skipped.append(f"- `{c.file}` (not part of this PR's diff): {c.message}")
+            continue
+        if c.line not in valid_lines:
+            skipped.append(f"- `{c.file}:{c.line}` (outside diff context): {c.message}")
+            continue
+
         label = f"**[{c.severity}]** `{c.category}` (confidence: {int(c.confidence * 100)}%)"
         body = f"{label}\n\n{c.message}"
         if c.suggestion:
@@ -94,16 +144,20 @@ def post_review_comments(repo_name: str, pr_number: int, result: ReviewResult, h
             "body": body
         })
 
-    # Post overall summary as a top-level comment
-    pr.create_issue_comment(f"## AI Review Summary\n\n{result.summary}")
+    # Post overall summary as a top-level comment, including anything we couldn't attach inline
+    summary_body = f"## AI Review Summary\n\n{result.summary}"
+    if skipped:
+        summary_body += "\n\n**Additional notes (couldn't attach to a specific line):**\n" + "\n".join(skipped)
+    pr.create_issue_comment(summary_body)
 
-    # Post line comments as a review
-    pr.create_review(
-        commit=repo.get_commit(head_sha),
-        body="",
-        event="COMMENT",
-        comments=comments
-    )
+    # Post line comments as a review (only if there's at least one valid comment)
+    if comments:
+        pr.create_review(
+            commit=repo.get_commit(head_sha),
+            body="",
+            event="COMMENT",
+            comments=comments
+        )
 
 
 def get_rules(repo_name: str) -> str:
