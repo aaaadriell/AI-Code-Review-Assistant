@@ -1,6 +1,7 @@
 import os
+import base64
 from dotenv import load_dotenv
-from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
+from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, Document
 from llama_index.vector_stores.pinecone import PineconeVectorStore
 from llama_index.core import StorageContext
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
@@ -58,23 +59,53 @@ def _find_source_files(repo_path: str) -> dict[str, list[str]]:
     return matches
 
 
-def build_index(repo_path: str):
-    # Find source files per language (excluding vendor/build directories)
+def _load_documents_by_language_from_disk(repo_path: str) -> dict[str, list[Document]]:
     files_by_language = _find_source_files(repo_path)
+    docs_by_language: dict[str, list[Document]] = {}
     for language, files in files_by_language.items():
         print(f"Found {len(files)} {language} files to index.")
+        docs_by_language[language] = SimpleDirectoryReader(input_files=files).load_data() if files else []
+    return docs_by_language
 
-    # Use HuggingFace embeddings (free, no API key needed)
+
+def _load_documents_by_language_from_github(repo_name: str, github_client) -> dict[str, list[Document]]:
+    """Fetch source files directly via the GitHub API instead of local disk.
+    This is what makes /reindex work in production (Railway has no local
+    clone of the sandbox repo, but it does have GitHub API access)."""
+    repo = github_client.get_repo(repo_name)
+    tree = repo.get_git_tree(sha=repo.default_branch, recursive=True)
+
+    docs_by_language: dict[str, list[Document]] = {lang: [] for lang in set(EXT_TO_LANGUAGE.values())}
+    for entry in tree.tree:
+        if entry.type != "blob":
+            continue
+        if any(part in EXCLUDED_DIRS for part in entry.path.split("/")):
+            continue
+        language = EXT_TO_LANGUAGE.get(os.path.splitext(entry.path)[1])
+        if not language:
+            continue
+
+        blob = repo.get_git_blob(entry.sha)
+        if blob.encoding != "base64":
+            continue  # skip binary/non-text blobs
+        content = base64.b64decode(blob.content).decode("utf-8", errors="ignore")
+        docs_by_language[language].append(Document(text=content, metadata={"file_name": entry.path}))
+
+    for language, docs in docs_by_language.items():
+        print(f"Found {len(docs)} {language} files to index (from GitHub).")
+    return docs_by_language
+
+
+def _build_and_persist_index(docs_by_language: dict[str, list[Document]]):
     embed_model = HuggingFaceEmbedding(model_name=EMBED_MODEL_NAME)
 
     # Each language needs its own CodeSplitter (tree-sitter grammar differs per language),
     # so we split per-language and combine the resulting nodes before building the index.
     all_nodes = []
     total_files = 0
-    for language, files in files_by_language.items():
-        if not files:
+    for language, documents in docs_by_language.items():
+        if not documents:
             continue
-        documents = SimpleDirectoryReader(input_files=files).load_data()
         splitter = CodeSplitter(
             language=language,
             chunk_lines=40,
@@ -82,7 +113,7 @@ def build_index(repo_path: str):
             max_chars=1500,
         )
         all_nodes.extend(splitter.get_nodes_from_documents(documents))
-        total_files += len(files)
+        total_files += len(documents)
 
     # Set up Pinecone (cloud-hosted, persists regardless of where indexing runs)
     pinecone_index = _get_pinecone_index()
@@ -97,6 +128,20 @@ def build_index(repo_path: str):
     )
     print(f"Indexed {total_files} files ({len(all_nodes)} chunks) across {len(EXT_TO_LANGUAGE)} languages.")
     return index
+
+
+def build_index(repo_path: str):
+    """Index from a local clone (for manual/local runs)."""
+    docs_by_language = _load_documents_by_language_from_disk(repo_path)
+    return _build_and_persist_index(docs_by_language)
+
+
+def build_index_from_github(repo_name: str, github_client):
+    """Index directly via the GitHub API (for the /reindex endpoint, works
+    identically locally and on Railway since no local clone is needed)."""
+    docs_by_language = _load_documents_by_language_from_github(repo_name, github_client)
+    return _build_and_persist_index(docs_by_language)
+
 
 if __name__ == "__main__":
     build_index("C:\\Users\\adrie\\Documents\\AI-Code-Review-Sandbox")
