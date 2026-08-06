@@ -26,8 +26,10 @@ In larger engineering teams:
 ## How the System Works
 
 ### Trigger
-A developer opens or updates a Pull Request on GitHub. This fires a GitHub Actions webhook,
-which calls the Review Service.
+A developer opens or updates a Pull Request on the target repository (the codebase being
+reviewed). A GitHub Actions workflow in *that* repo fires on `pull_request` events and calls
+the Review Service's `/review` endpoint. (This repo only contains the workflow that keeps the
+RAG index fresh — see Step 5; the PR-trigger workflow lives in each reviewed repo.)
 
 ### Step 1 — Fetch PR Context
 The Review Service calls the GitHub API to retrieve:
@@ -68,8 +70,16 @@ API — attached to the specific line in the diff it refers to, with a severity 
 
 ### Step 5 — Observability & Feedback
 - Every LLM call is logged to Langfuse: latency, token count, cost per PR
-- Engineers can react to comments with 👍 / 👎 via a thin feedback endpoint
-- Negative feedback is logged for prompt improvement over time
+- Each posted comment has a hidden HTML marker embedding the Langfuse trace ID and the
+  observation ID for that specific comment
+- When an engineer replies to an AI comment on GitHub, a webhook fires to `/github-comment`,
+  which reads the marker off the parent comment, uses Claude (Haiku) to classify whether the
+  reply indicates the comment was helpful, and logs that as a boolean score on the exact trace
+  in Langfuse — fully automatic, no manual voting UI required
+- A `/feedback` endpoint also exists for submitting the same kind of score directly (used for
+  testing, or a future UI)
+- The codebase is kept current for RAG retrieval via a separate `/reindex` endpoint, triggered
+  automatically by a GitHub Actions workflow whenever the target repo's `main` branch changes
 
 ---
 
@@ -98,11 +108,11 @@ API — attached to the specific line in the diff it refers to, with a severity 
 │    RAG Service      │       │         Claude API          │
 │                     │       │      (Anthropic)            │
 │  - Vector DB        │       └────────────────────────────┘
-│    (ChromaDB/       │
-│     Pinecone)       │       ┌────────────────────────────┐
-│  - Codebase index   │       │         Langfuse            │
-│  - Retriever        │       │   (Observability & Logs)    │
-└─────────────────────┘       └────────────────────────────┘
+│    (Pinecone)       │
+│  - Codebase index   │       ┌────────────────────────────┐
+│  - Retriever        │       │         Langfuse            │
+└─────────────────────┘       │   (Observability & Logs)    │
+                               └────────────────────────────┘
 ```
 
 ### Services
@@ -110,7 +120,7 @@ API — attached to the specific line in the diff it refers to, with a severity 
 | Service | Responsibility | Tech |
 |---|---|---|
 | **Review Service** | Orchestrates the full review pipeline | FastAPI, Python |
-| **RAG Service** | Indexes codebase, retrieves relevant context at review time | LlamaIndex, ChromaDB |
+| **RAG Service** | Indexes codebase, retrieves relevant context at review time | LlamaIndex, Pinecone |
 | **GitHub Actions** | Triggers the pipeline on PR events | YAML workflow |
 | **Observability** | Logs latency, cost, token usage, feedback | Langfuse |
 
@@ -126,8 +136,8 @@ interesting component you can speak to in interviews.
 |---|---|---|
 | **LLM** | Claude API (Anthropic) | Strong code understanding, structured output support |
 | **RAG Framework** | LlamaIndex | Better suited for codebase indexing than LangChain |
-| **Vector DB** | ChromaDB (local dev) / Pinecone (prod) | ChromaDB for zero-cost local testing; Pinecone for deployment |
-| **Code Chunking** | Tree-sitter | Splits code by AST (functions, classes) rather than arbitrary characters — far better for retrieval |
+| **Vector DB** | Pinecone | Cloud-hosted, so the index persists identically whether indexing runs locally or on Railway — no local-disk persistence problem to solve |
+| **Code Chunking** | Tree-sitter | Splits code by AST (functions, classes) rather than arbitrary characters — far better for retrieval. Currently supports Python, TypeScript, and TSX |
 | **API Framework** | FastAPI | Async, fast, easy to document |
 | **GitHub Integration** | PyGitHub | Python wrapper for GitHub REST API |
 | **CI Trigger** | GitHub Actions | Native, no extra infra needed |
