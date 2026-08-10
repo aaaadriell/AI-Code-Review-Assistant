@@ -26,107 +26,134 @@ In larger engineering teams:
 ## How the System Works
 
 ### Trigger
-A developer opens or updates a Pull Request on the target repository (the codebase being
-reviewed). A GitHub Actions workflow in *that* repo fires on `pull_request` events and calls
-the Review Service's `/review` endpoint. (This repo only contains the workflow that keeps the
-RAG index fresh — see Step 5; the PR-trigger workflow lives in each reviewed repo.)
+A developer opens or updates a Pull Request on the sandbox (target) repository. A GitHub
+Actions workflow **in that repo** (`ai-review.yml`) fires on `pull_request` events and calls
+the Review Service's `/review` endpoint with the repo name, PR number, and base/head SHAs.
+All three CI/CD workflows that drive this system live in the sandbox repo, not this one —
+see the [CI/CD](#cicd--github-actions-in-the-sandbox-repo) section below.
 
 ### Step 1 — Fetch PR Context
-The Review Service calls the GitHub API to retrieve:
-- The full diff (what changed)
-- A list of all files modified in the PR
-- The `RULES.md` file from the root of the repository
+The Review Service calls the GitHub API (via PyGithub) to retrieve:
+- The full diff (what changed, per file)
+- The list of files actually modified in the PR
+- The `RULES.md` file from the root of the repository (falls back to "apply general best
+  practices" if the repo doesn't have one)
 
 ### Step 2 — RAG: Retrieve Relevant Repo Context
-The diff alone is insufficient. A function changed in one file may break callers in three
-other files not in the diff. To handle this, the system maintains a vector index of the
-entire codebase.
+The diff alone is insufficient — a function changed in one file may break callers in files
+not in the diff at all. So the service maintains a vector index of the entire codebase in
+Pinecone and retrieves relevant context at review time:
 
-At review time:
-- Changed files are identified
-- The RAG service retrieves the most semantically relevant files — files that import changed
-  modules, files in the same package, files with related function signatures
-- These are appended to the prompt as supporting context
+1. Claude Haiku generates a short search query from the diff (e.g. "find usages of the
+   `Customer` interface and the `fetchCustomer` API function")
+2. That query is embedded and used to retrieve the top-k most similar code chunks from Pinecone
+3. Each retrieved chunk carries its file name and cosine similarity score, both surfaced back
+   into the prompt and logged for evaluation (see Observability below)
 
-This is the core technical differentiator of the project.
+This retrieval step is instrumented as its own Langfuse **retriever** span, nested under the
+same trace as the review it feeds into — not a disconnected, invisible step.
 
 ### Step 3 — LLM Review
-The orchestrator constructs a structured prompt containing:
-- The PR diff
-- Retrieved repo context from RAG
-- The team's `RULES.md`
-- A strict output schema (JSON) specifying how comments must be formatted
+Claude Opus receives a structured prompt containing the diff, the retrieved RAG context, and
+`RULES.md`, and is required to return JSON matching a strict Pydantic schema
+(`ReviewComment`/`ReviewResult` in `models.py`). It reviews against:
+- **Its own training knowledge** for bug risks (logic errors, broken function calls, type
+  mismatches) and security issues (injection, auth bypass, exposed secrets)
+- **RULES.md** for team-specific standards
 
-Claude reviews the diff against:
-- **Its own training knowledge** for bug risks (null pointer risks, race conditions, logic
-  errors) and security issues (injection, auth bypass, exposed secrets, OWASP Top 10)
-- **RULES.md** for team-specific standards (naming conventions, required patterns, internal
-  library usage, company security policies)
+LLM structured output isn't always perfectly reliable — Claude occasionally omits a field
+(most often `confidence`) even when told it's required. To keep one flaky field from crashing
+an entire review, `confidence` has a safe default (`0.5`) in the schema rather than being
+strictly required.
 
 ### Step 4 — Post Comments to PR
-The structured JSON response is parsed and each comment is posted to the PR via the GitHub
-API — attached to the specific line in the diff it refers to, with a severity label
-(BLOCKING / WARNING / SUGGESTION) and a confidence score.
+Each comment is posted via the GitHub API, attached to the specific line it refers to, with
+severity (BLOCKING / WARNING / SUGGESTION), category, and confidence.
 
-### Step 5 — Observability & Feedback
-- Every LLM call is logged to Langfuse: latency, token count, cost per PR
-- Each posted comment has a hidden HTML marker embedding the Langfuse trace ID and the
-  observation ID for that specific comment
-- When an engineer replies to an AI comment on GitHub, a webhook fires to `/github-comment`,
-  which reads the marker off the parent comment, uses Claude (Haiku) to classify whether the
-  reply indicates the comment was helpful, and logs that as a boolean score on the exact trace
-  in Langfuse — fully automatic, no manual voting UI required
-- A `/feedback` endpoint also exists for submitting the same kind of score directly (used for
-  testing, or a future UI)
-- The codebase is kept current for RAG retrieval via a separate `/reindex` endpoint, triggered
-  automatically by a GitHub Actions workflow whenever the target repo's `main` branch changes
+GitHub's review API only accepts line numbers that are actually visible within a diff hunk —
+not just any line that exists in the file. Since Claude occasionally points at a line just
+outside that window, the service parses the real diff hunks itself (`_valid_diff_lines`) and
+downgrades any comment whose line can't be anchored into the PR-level summary instead of
+letting the whole review fail with a GitHub 422.
+
+Each posted comment also carries a **hidden HTML marker** (invisible when rendered on GitHub)
+embedding that comment's exact Langfuse trace ID and observation ID — this is what makes the
+feedback loop in Step 5 possible without a database.
+
+### Step 5 — Observability, RAG Evaluation & Feedback
+Every review is one connected Langfuse trace, not a scattered pile of disconnected logs:
+
+- **Cost/latency tracking** — every LLM call (query generation, review, classification) is
+  logged automatically via Langfuse's `@observe()` decorator: tokens, latency, cost per PR
+- **RAG evaluation, tier 1 (visibility)** — the retriever span logs every retrieved chunk with
+  its real similarity score, so you can inspect exactly what was retrieved for any past review
+  instead of treating RAG as a black box
+- **RAG evaluation, tier 2 (automated)** — after every retrieval, Claude Haiku acts as a judge,
+  scoring how relevant the retrieved chunks actually were to the diff (0.0–1.0), logged as a
+  Langfuse score attached directly to the retrieval span. This runs on every single review with
+  no human input required
+- **Human feedback (automatic)** — when an engineer replies to an AI comment on GitHub, the
+  `ai-feedback.yml` workflow forwards it to `/github-comment`, which reads the hidden marker
+  off the parent comment, uses Claude Haiku to classify whether the reply indicates the comment
+  was helpful, and logs a boolean score against the *exact* comment (not just the review as a
+  whole) — fully automatic, no voting UI needed
+- **Human feedback (manual)** — `/feedback` accepts the same kind of score directly, used for
+  testing or a future UI
+- **Index freshness** — the codebase index is kept current via `/reindex`, triggered by the
+  `re-index_codebase.yml` workflow whenever the sandbox repo's `main` branch changes. Re-indexing
+  always wipes the Pinecone index before rebuilding, since documents aren't given stable IDs and
+  re-indexing without a clean slate silently accumulates duplicate vectors over time
 
 ---
 
 ## System Architecture
 
+The Review Service is a **single FastAPI application** (`main.py`) — it fetches diffs, retrieves
+RAG context, calls Claude, posts comments, handles feedback, and re-indexes, all in one process.
+There is no separate RAG microservice; `indexer.py` is a shared module used both by a standalone
+local script and by the `/reindex` endpoint. This is intentionally lean rather than
+over-engineered — the RAG/evaluation logic is what's technically interesting, not the service
+count.
+
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        GitHub                               │
-│   PR Opened/Updated ──► GitHub Actions Workflow             │
-└────────────────────────────┬────────────────────────────────┘
-                             │ HTTP POST (diff, repo, PR metadata)
-                             ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   Review Service (FastAPI)                   │
-│                                                             │
-│  1. Fetch diff + RULES.md via GitHub API                    │
-│  2. Call RAG Service for relevant repo context              │
-│  3. Build prompt, call Claude API                           │
-│  4. Parse structured JSON response                          │
-│  5. Post line comments back to GitHub PR                    │
-│  6. Log to Langfuse                                         │
-└────────┬─────────────────────────────────┬──────────────────┘
-         │                                 │
-         ▼                                 ▼
-┌─────────────────────┐       ┌────────────────────────────┐
-│    RAG Service      │       │         Claude API          │
-│                     │       │      (Anthropic)            │
-│  - Vector DB        │       └────────────────────────────┘
-│    (Pinecone)       │
-│  - Codebase index   │       ┌────────────────────────────┐
-│  - Retriever        │       │         Langfuse            │
-└─────────────────────┘       │   (Observability & Logs)    │
-                               └────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                    Sandbox Repo (GitHub)                         │
+│                                                                    │
+│  ai-review.yml    ──► fires on PR opened/synchronize              │
+│  ai-feedback.yml  ──► fires on PR review comment created          │
+│  re-index_codebase.yml ──► fires on push to main                  │
+└──────┬──────────────────────┬──────────────────────┬──────────────┘
+       │ /review              │ /github-comment       │ /reindex
+       ▼                      ▼                       ▼
+┌───────────────────────────────────────────────────────────────────┐
+│                  Review Service (FastAPI, Railway)                 │
+│                                                                     │
+│  get_pr_diff / get_rules ──► PyGithub ──► GitHub REST API          │
+│  generate_retrieval_query ──► Claude Haiku                         │
+│  retrieve_context ──► Pinecone (embeddings via HuggingFace model)  │
+│  review_diff ──► Claude Opus ──► structured JSON (Pydantic)        │
+│  post_review_comments ──► PyGithub (line-validated, hidden markers)│
+│  classify_feedback_helpfulness / classify_retrieval_relevance      │
+│    ──► Claude Haiku (LLM-as-judge)                                 │
+│  every call traced via @observe() ──► Langfuse                     │
+└──────────────┬───────────────────────────────┬─────────────────────┘
+               ▼                                ▼
+     ┌───────────────────┐            ┌───────────────────────┐
+     │      Pinecone       │            │       Langfuse         │
+     │  codebase vector idx│            │  traces, cost, RAG eval│
+     │  (Python/TS/TSX,     │            │  scores, human feedback│
+     │   Tree-sitter chunks)│            └───────────────────────┘
+     └───────────────────┘
 ```
 
-### Services
+### Components
 
-| Service | Responsibility | Tech |
+| Component | Responsibility | Tech |
 |---|---|---|
-| **Review Service** | Orchestrates the full review pipeline | FastAPI, Python |
-| **RAG Service** | Indexes codebase, retrieves relevant context at review time | LlamaIndex, Pinecone |
-| **GitHub Actions** | Triggers the pipeline on PR events | YAML workflow |
-| **Observability** | Logs latency, cost, token usage, feedback | Langfuse |
-
-This is intentionally a **lean two-service architecture** rather than over-engineered
-microservices. The Review Service is the core; the RAG Service is the technically
-interesting component you can speak to in interviews.
+| **Review Service** | Everything: diff fetch, RAG, review, comments, feedback, reindexing | FastAPI, Python |
+| **Vector index** | Stores codebase chunks for retrieval | Pinecone + LlamaIndex |
+| **GitHub Actions (sandbox repo)** | Triggers review, feedback forwarding, and reindexing | YAML workflows |
+| **Observability** | Traces, cost, RAG evaluation scores, human feedback | Langfuse |
 
 ---
 
@@ -134,16 +161,67 @@ interesting component you can speak to in interviews.
 
 | Category | Tool | Why |
 |---|---|---|
-| **LLM** | Claude API (Anthropic) | Strong code understanding, structured output support |
+| **LLM (review)** | Claude Opus | Strong code understanding, structured JSON output |
+| **LLM (cheap tasks)** | Claude Haiku | Retrieval query generation, RAG-relevance judging, and reply-sentiment classification are all cheap, fast tasks that don't need Opus |
 | **RAG Framework** | LlamaIndex | Better suited for codebase indexing than LangChain |
-| **Vector DB** | Pinecone | Cloud-hosted, so the index persists identically whether indexing runs locally or on Railway — no local-disk persistence problem to solve |
-| **Code Chunking** | Tree-sitter | Splits code by AST (functions, classes) rather than arbitrary characters — far better for retrieval. Currently supports Python, TypeScript, and TSX |
+| **Vector DB** | Pinecone (previously ChromaDB) | Started with ChromaDB for local development since it's zero-setup and file-based. Switched to Pinecone once deploying to Railway, because ChromaDB's `PersistentClient` writes to local disk — which doesn't survive Railway's ephemeral filesystem between deploys/restarts. Pinecone is cloud-hosted, so the index persists identically whether indexing runs locally or in production, and `/reindex` works the same way in both places |
+| **Embeddings** | HuggingFace `sentence-transformers/all-MiniLM-L6-v2` | LlamaIndex defaults to OpenAI embeddings, which would mean depending on a second LLM provider just for embeddings. This model is free, runs locally, and needs no API key, keeping the project entirely on Anthropic + open-source tooling |
+| **Code Chunking** | Tree-sitter (`CodeSplitter`), previously LlamaIndex's default chunker | Started with LlamaIndex's default character-count chunking, which splits functions and classes mid-way — a chunk could end halfway through a function body, badly hurting retrieval relevance. Switched to Tree-sitter, which parses each file's AST and chunks along function/class boundaries instead, so retrieved context is always a complete, coherent unit. One `CodeSplitter` per language (Python, TypeScript, TSX), since each needs its own grammar |
 | **API Framework** | FastAPI | Async, fast, easy to document |
 | **GitHub Integration** | PyGitHub | Python wrapper for GitHub REST API |
-| **CI Trigger** | GitHub Actions | Native, no extra infra needed |
-| **Observability** | Langfuse | Tracks cost, latency, and feedback per PR |
-| **Containerisation** | Docker + Docker Compose | Packages Review Service + ChromaDB together |
-| **Deployment** | Railway or Render | Free-tier friendly for a portfolio project |
+| **CI/CD** | GitHub Actions (in the sandbox repo) | Native, no extra infra needed — see below |
+| **Observability & RAG eval** | Langfuse | Tracks cost, latency, retrieval quality, and both automated and human feedback per PR |
+| **Deployment** | Railway | Native Python buildpack via `Procfile` + `requirements.txt` — no containerization was needed |
+
+---
+
+## CI/CD — GitHub Actions in the Sandbox Repo
+
+All three workflows that drive this system live in the **sandbox repo**
+(`AI-Code-Review-Sandbox`), not this repo — this repo is the service being called, the
+sandbox repo is the codebase being reviewed, and it's the one that experiences PR events.
+Each workflow does the minimum possible work itself and immediately hands off to the Review
+Service via `secrets.REVIEW_SERVICE_URL`.
+
+### `ai-review.yml` — triggers a review
+```yaml
+on:
+  pull_request:
+    types: [opened, synchronize]
+```
+Fires whenever a PR is opened or pushed to. POSTs the repo name, PR number, and base/head
+SHAs to `/review`. This is the main entry point for the whole system.
+
+### `ai-feedback.yml` — forwards reply feedback
+```yaml
+on:
+  pull_request_review_comment:
+    types: [created]
+```
+Fires on *every* new PR review comment — including the bot's own initial comments and human
+replies. It forwards the comment to `/github-comment`, which decides server-side whether it's
+a reply worth scoring (see Step 5 above).
+
+This one is built with `actions/github-script` rather than a plain `curl` in a `run:` step,
+deliberately. A naive workflow would interpolate `${{ github.event.comment.body }}` — arbitrary,
+attacker-controllable PR comment text — directly into a shell command, which is a real
+[script-injection vulnerability](https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#understanding-the-risk-of-script-injections):
+anyone who can comment on the PR could inject shell metacharacters. `github-script` runs in
+Node.js and sends the body through `JSON.stringify()` inside a `fetch()` call, so untrusted text
+never touches a shell at all.
+
+### `re-index_codebase.yml` — keeps the RAG index fresh
+```yaml
+on:
+  push:
+    branches:
+      - main
+```
+Fires whenever `main` changes. POSTs the repo name to `/reindex`, which re-fetches every
+source file **directly via the GitHub API** (not a local clone) and rebuilds the Pinecone
+index from scratch. Reading from the GitHub API rather than disk is what makes this work
+identically whether `/reindex` runs locally or on Railway — Railway's containers don't have
+a checkout of the sandbox repo sitting on disk.
 
 ---
 

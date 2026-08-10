@@ -117,6 +117,15 @@ def _build_and_persist_index(docs_by_language: dict[str, list[Document]]):
 
     # Set up Pinecone (cloud-hosted, persists regardless of where indexing runs)
     pinecone_index = _get_pinecone_index()
+
+    # Wipe existing vectors before every rebuild. Documents don't have stable IDs,
+    # so re-indexing without this just piles new vectors on top of old ones forever
+    # (this is always a full repo re-index, never incremental, so a clean slate is correct).
+    try:
+        pinecone_index.delete(delete_all=True)
+    except Exception as e:
+        print(f"  Skipping clear (index likely already empty): {e}")
+
     vector_store = PineconeVectorStore(pinecone_index=pinecone_index)
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
 

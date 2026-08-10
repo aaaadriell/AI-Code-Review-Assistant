@@ -197,18 +197,34 @@ def get_rules(repo_name: str) -> str:
         return "No RULES.md found. Apply general best practices only."
 
 
-def retrieve_context(query: str, top_k: int = 5) -> str:
+@observe(as_type="retriever")
+def retrieve_context(query: str, top_k: int = 5) -> dict:
+    """Retrieves the top-k most similar codebase chunks for a query. Instrumented
+    as a Langfuse retriever span - the query is auto-captured as input, and the
+    returned dict (with per-chunk similarity scores) as output, so retrieval
+    quality is inspectable per-review instead of being a black box."""
+    langfuse_client = get_langfuse_client()
+
     index = VectorStoreIndex.from_vector_store(
         vector_store, storage_context=storage_context, embed_model=embed_model
     )
     retriever = index.as_retriever(similarity_top_k=top_k)
     nodes = retriever.retrieve(query)
 
+    chunks = []
     context = ""
     for node in nodes:
-        context += f"\n### {node.metadata.get('file_name', 'unknown')}\n"
-        context += node.text
-    return context
+        file_name = node.metadata.get("file_name", "unknown")
+        score = float(node.score) if node.score is not None else None
+        chunks.append({"file": file_name, "score": score, "snippet": node.text[:500]})
+        header = f"\n### {file_name}" + (f" (similarity: {score:.3f})" if score is not None else "") + "\n"
+        context += header + node.text
+
+    return {
+        "context": context,
+        "chunks": chunks,
+        "observation_id": langfuse_client.get_current_observation_id(),
+    }
 
 
 def generate_retrieval_query(diff: str) -> str:
@@ -230,6 +246,80 @@ def generate_retrieval_query(diff: str) -> str:
     return message.content[0].text.strip()
 
 
+def classify_retrieval_relevance(diff: str, chunks: list[dict]) -> tuple[float, str]:
+    """LLM-as-judge: score how relevant the retrieved codebase chunks actually
+    are to the diff being reviewed. Runs automatically on every review, giving a
+    continuous quality signal for RAG retrieval with no human input needed."""
+    if not chunks:
+        return 0.0, "No chunks were retrieved."
+
+    chunks_summary = "\n\n".join(
+        f"File: {c['file']} (similarity: {c['score']:.3f})\n{c['snippet']}"
+        for c in chunks
+    )
+
+    message = anthropic_client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=200,
+        messages=[{
+            "role": "user",
+            "content": f"""You are evaluating a RAG retrieval step for an AI code reviewer.
+
+Given the code diff being reviewed and the codebase chunks that were retrieved as
+"related context", judge how relevant and useful the retrieved chunks actually are
+for reviewing this specific diff.
+
+DIFF:
+{diff[:2000]}
+
+RETRIEVED CHUNKS:
+{chunks_summary}
+
+Respond in EXACTLY this format, two lines, no other text:
+SCORE: <a number from 0.0 (irrelevant) to 1.0 (highly relevant and useful)>
+REASON: <one sentence explaining why>"""
+        }]
+    )
+
+    text = message.content[0].text.strip()
+    score, reason = 0.5, ""
+    for line in text.splitlines():
+        if line.upper().startswith("SCORE:"):
+            try:
+                score = max(0.0, min(1.0, float(line.split(":", 1)[1].strip())))
+            except ValueError:
+                pass
+        elif line.upper().startswith("REASON:"):
+            reason = line.split(":", 1)[1].strip()
+    return score, reason
+
+
+@observe()
+def run_review_pipeline(diff: str, rules: str):
+    """Runs query generation, retrieval, and the Claude review as one Langfuse
+    trace (query gen inline, retrieval and review as nested spans) so retrieval
+    quality can be correlated with the review it actually produced - without this,
+    retrieval and review would show up as two disconnected, uncorrelated traces."""
+    langfuse_client = get_langfuse_client()
+    trace_id = langfuse_client.get_current_trace_id()
+
+    query = generate_retrieval_query(diff)
+    retrieval = retrieve_context(query, top_k=5)
+
+    result, _, observation_ids = review_diff(diff, rules, retrieval["context"])
+
+    # Automated RAG eval: attach an LLM-judged relevance score directly to the
+    # retrieval span, so you can see retrieval quality per-review in Langfuse
+    # without waiting on human feedback.
+    relevance_score, relevance_reason = classify_retrieval_relevance(diff, retrieval["chunks"])
+    submit_langfuse_score(
+        trace_id, retrieval["observation_id"], relevance_score, relevance_reason,
+        name="retrieval_relevance", data_type="NUMERIC"
+    )
+
+    return result, trace_id, observation_ids, query, retrieval
+
+
 @app.post("/review")
 async def review(request: Request):
     payload = await request.json()
@@ -242,13 +332,10 @@ async def review(request: Request):
         rules = get_rules(payload["repo"])
         print(f"3. Got rules: {len(rules)} chars")
 
-        query = generate_retrieval_query(diff)
+        feedback, trace_id, observation_ids, query, retrieval = run_review_pipeline(diff, rules)
         print(f"4. Generated retrieval query: {query}")
+        print(f"5. Retrieved {len(retrieval['chunks'])} chunks: {[c['file'] for c in retrieval['chunks']]}")
 
-        context = retrieve_context(query, top_k=5)
-        print(f"5. Retrieved context: {len(context)} chars")
-
-        feedback, trace_id, observation_ids = review_diff(diff, rules, context)
         print(f"6. Got feedback: {feedback}")
 
         post_review_comments(payload["repo"], payload["pr_number"], feedback, payload["head_sha"], trace_id, observation_ids)
@@ -288,9 +375,10 @@ async def reindex(request: Request):
         return {"status": "error", "message": str(e)}
 
 
-def submit_langfuse_score(trace_id: str, observation_id: str | None, helpful: bool, comment: str = "") -> bool:
-    """Submit a 'helpful' boolean score to Langfuse via its REST API. Returns
-    True if the score was accepted, False otherwise (never raises)."""
+def submit_langfuse_score(trace_id: str, observation_id: str | None, value, comment: str = "", name: str = "helpful", data_type: str = "BOOLEAN") -> bool:
+    """Submit a score to Langfuse via its REST API. `value` is a bool for BOOLEAN
+    scores (e.g. human 'helpful' feedback) or a float for NUMERIC scores (e.g.
+    automated retrieval relevance). Returns True if accepted, never raises."""
     public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
     secret_key = os.getenv("LANGFUSE_SECRET_KEY")
     base_url = os.getenv("LANGFUSE_BASE_URL", "https://cloud.langfuse.com")
@@ -299,12 +387,14 @@ def submit_langfuse_score(trace_id: str, observation_id: str | None, helpful: bo
         print("  Langfuse credentials not configured, skipping score")
         return False
 
+    score_value = (1 if value else 0) if data_type == "BOOLEAN" else value
+
     score_payload = {
         "traceId": trace_id,
         "observationId": observation_id,
-        "name": "helpful",
-        "value": 1 if helpful else 0,
-        "dataType": "BOOLEAN",
+        "name": name,
+        "value": score_value,
+        "dataType": data_type,
         "comment": comment
     }
     response = requests.post(
@@ -315,7 +405,7 @@ def submit_langfuse_score(trace_id: str, observation_id: str | None, helpful: bo
     )
 
     if response.status_code in [200, 201]:
-        print(f"  Score submitted to Langfuse successfully: {response.json()}")
+        print(f"  Score '{name}' submitted to Langfuse successfully: {response.json()}")
         return True
     print(f"  Langfuse API error: {response.status_code} - {response.text}")
     return False
